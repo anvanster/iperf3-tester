@@ -6,7 +6,7 @@ import concurrent.futures # For parallel client execution
 import itertools # For parameter combinations if needed, though manual loops are fine
 
 from .config import TestConfiguration, ConfigError
-from .iperf3_controller import RemoteServerManager, run_iperf3_client, run_iperf3_client_wrapper # Import wrapper
+from .iperf3_controller import RemoteServerManager, run_iperf3_client_wrapper # Import wrapper
 from .network import check_ssh_connectivity, get_local_ip_address
 from .results import ResultsCollector, ReportGenerator 
 from .utils import ConfigError as UtilConfigError
@@ -86,6 +86,18 @@ class IperfTestRunner:
         logger.info("--- Setting up testing environment ---")
         current_iperf3_path = self.config.iperf3_path # Get potentially overridden path
 
+        # Check for client-only mode
+        client_only = self.config.network_config.get("client_only", False)
+        if client_only:
+            logger.info("Client-only mode enabled. Skipping remote server management.")
+            try:
+                self.local_ip = get_local_ip_address()
+                logger.info(f"Auto-detected local IP: {self.local_ip}")
+            except RuntimeError as e:
+                logger.error(f"Failed to auto-detect local IP: {e}")
+                return False
+            return True
+
         # Get local IP
         configured_local_ip = self.config.network_config.get("local_ip", "auto-detect")
         if configured_local_ip and configured_local_ip.lower() != "auto-detect":
@@ -98,42 +110,37 @@ class IperfTestRunner:
             except RuntimeError as e:
                 logger.error(f"Failed to auto-detect local IP: {e}")
                 return False
-        
-        remote_ip = self.config.remote_ip
+
+        # Check for SSH credentials
+        remote_ip = self.config.network_config.get("remote_ip")
         ssh_user = self.config.network_config.get("ssh_user")
-        ssh_key_path = self.config.network_config.get("ssh_key_path")
-        ssh_password = self.config.network_config.get("ssh_password")
-
+        ssh_key = self.config.network_config.get("ssh_key_path")
+        ssh_pass = self.config.network_config.get("ssh_password")
         if not remote_ip or not ssh_user:
-            logger.error("Remote IP or SSH user not configured. Cannot proceed.")
+            logger.error("Remote IP or SSH user not configured. Cannot proceed. If the remote server is already running iperf3, set 'client_only': true in the config.")
             return False
-        
-        logger.info(f"Remote server IP: {remote_ip}, SSH User: {ssh_user}, iPerf3 path (remote): {current_iperf3_path}")
-        if ssh_key_path: logger.info(f"Using SSH key: {ssh_key_path}")
 
-        logger.info(f"Checking SSH connectivity to {ssh_user}@{remote_ip}...")
-        if not check_ssh_connectivity(remote_ip, ssh_user, ssh_key_path, ssh_password):
-            logger.error(f"SSH connectivity check failed for {ssh_user}@{remote_ip}.")
+        # Check SSH connectivity
+        logger.info(f"Attempting SSH connectivity to {ssh_user}@{remote_ip}...")
+        if not check_ssh_connectivity(remote_ip, ssh_user, ssh_key, ssh_pass):
+            logger.error("SSH connectivity failed. Cannot proceed.")
             return False
         logger.info("SSH connectivity successful.")
 
+        # Start remote iperf3 servers
         self.server_manager = RemoteServerManager(
             ssh_user=ssh_user,
             remote_ip=remote_ip,
-            ssh_key_path=ssh_key_path,
-            port_range_start=self.config.port_range.get("start", 52001),
-            port_range_end=self.config.port_range.get("end", 52016),
-            iperf3_path=current_iperf3_path # Pass iperf3_path to server manager
+            ssh_key_path=ssh_key,
+            port_range_start=self.config.network_config.get("port_range", {}).get("start", 52001),
+            port_range_end=self.config.network_config.get("port_range", {}).get("end", 52016),
+            iperf3_path=current_iperf3_path,
+            ssh_password=ssh_pass
         )
-
-        logger.info("Starting remote iperf3 servers...")
-        active_servers = self.server_manager.start_remote_servers()
-        if not active_servers:
-            logger.error("Failed to start any iperf3 servers on the remote machine.")
+        self.server_manager.start_remote_servers()
+        if not self.server_manager.active_server_pids:
+            logger.error("Failed to start any iperf3 servers on the remote machine. Aborting.")
             return False
-        
-        logger.info(f"Successfully started {len(active_servers)} iperf3 server(s) on ports {list(active_servers.keys())}.")
-        logger.info("--- Environment setup complete ---")
         return True
 
     def _cleanup_environment(self):
@@ -162,26 +169,25 @@ class IperfTestRunner:
             logger.info("--- Iterating through Test Parameter Matrix ---")
 
             # Retrieve test parameter lists from config
-            # Ensure test_parameters is a dict, otherwise default to empty list or sensible default
             tp_config = self.config.test_parameters if isinstance(self.config.test_parameters, dict) else {}
-            
             protocols = tp_config.get('protocols', ['tcp'])
             directions = tp_config.get('directions', ['tx'])
             message_sizes = tp_config.get('message_sizes', [None]) 
             window_sizes = tp_config.get('window_sizes', [None])
             iperf3_P_streams_list = tp_config.get('parallel_streams', [1]) # -P option for iperf3
-            
-            # Test duration is already potentially overridden by CLI via _apply_cli_overrides
             base_test_duration = self.config.test_parameters.get('test_duration', 10)
-            
-            # Get iperf3 path (potentially overridden by CLI)
             current_iperf3_path = self.config.iperf3_path
 
-            # Active server ports (where servers are confirmed running)
-            active_ports = list(self.server_manager.active_server_pids.keys())
-            if not active_ports:
-                logger.error("No active iperf3 server ports found after setup. Cannot run client tests.")
-                return
+            # Determine ports to use
+            if self.server_manager is not None:
+                active_ports = list(self.server_manager.active_server_pids.keys())
+            else:
+                # Client-only mode: use port(s) from config
+                port_range = self.config.network_config.get("port_range", {})
+                port_start = port_range.get("start", 52001)
+                port_end = port_range.get("end", port_start)
+                active_ports = list(range(port_start, port_end + 1))
+                logger.info(f"Client-only mode: using ports from config: {active_ports}")
 
             target_ip = self.config.remote_ip # From network_config, accessed via property
 
@@ -316,6 +322,12 @@ class IperfTestRunner:
             logger.info("Report generation to file is disabled in configuration (save_to_file: false).")
         
         logger.info("--- Report generation phase complete ---")
+        # Force JSON report generation for debugging
+        output_conf = self.config.output_config
+        results_dir = output_conf.get('results_directory', 'results')
+        json_filename = output_conf.get('json_report_filename', 'iperf3_results.json')
+        report_generator = ReportGenerator(self.results_collector.get_all_results(), results_directory=results_dir)
+        report_generator.generate_json_report(filename=json_filename)
 
 def main():
     """

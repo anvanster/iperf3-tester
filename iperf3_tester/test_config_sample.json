@@ -9,27 +9,25 @@
     "bandwidth": "1M", 
     "packet_size": "128K", 
     "tos": 0,
-    "ssh_user": "root",
-    "ssh_password": "Admin@12"
+    "client_only": true
   },
   "test_parameters": {
-    "test_duration": 10,
+    "test_duration": 5,
     "parallel_streams": [1], 
-    "protocols": ["tcp", "udp"],
-    "directions": ["tx", "rx", "bx"],
-    "message_sizes": [null, "64K", "128K"],
+    "protocols": ["tcp"],
+    "directions": ["tx"],
+    "message_sizes": [null],
     "window_sizes": [null],
     "reporting_interval": 1,
     "warmup_time": 0,
-    "udp_bandwidth": "1G",
     "client_options": [] 
   },
   "execution_config": {
-    "max_retries": 3,
-    "retry_delay": 5,
-    "timeout_seconds": 60,
+    "max_retries": 1,
+    "retry_delay": 2,
+    "timeout_seconds": 30,
     "iperf3_path": "iperf3",
-    "max_concurrent_clients_per_iteration": 0 
+    "max_concurrent_clients_per_iteration": 1 
   },
   "output_config": {
     "log_file": "iperf3_test.log",
@@ -37,7 +35,7 @@
     "results_directory": "results",
     "save_to_file": true,
     "verbosity": 1,
-    "json_report_filename": "iperf3_results.json",
-    "csv_report_filename": "iperf3_results.csv"
+    "json_report_filename": "iperf3_results_sample.json",
+    "csv_report_filename": "iperf3_results_sample.csv"
   }
 }

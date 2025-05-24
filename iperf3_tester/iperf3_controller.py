@@ -13,7 +13,7 @@ class RemoteServerManager:
     """
     Manages iperf3 servers on a remote machine via SSH.
     """
-    def __init__(self, ssh_user, remote_ip, ssh_key_path=None, port_range_start=52001, port_range_end=52016, iperf3_path="iperf3"):
+    def __init__(self, ssh_user, remote_ip, ssh_key_path=None, port_range_start=52001, port_range_end=52016, iperf3_path="iperf3", ssh_password=None):
         """
         Initializes the RemoteServerManager.
 
@@ -32,51 +32,98 @@ class RemoteServerManager:
         self.port_range_end = port_range_end
         self.iperf3_path = iperf3_path # Store iperf3 path
         self.active_server_pids = {}  # Stores port: pid mapping
+        self.ssh_password = ssh_password
 
     def _execute_remote_command(self, command, check_output=False, timeout=30):
         """
         Executes a command on the remote server via SSH.
-
-        Args:
-            command (str): The command to execute.
-            check_output (bool, optional): If True, returns stdout. Otherwise, returns CompletedProcess.
-                                         Defaults to False.
-            timeout (int, optional): Timeout for the command execution. Defaults to 30 seconds.
-
-        Returns:
-            str or subprocess.CompletedProcess: stdout if check_output is True, else CompletedProcess.
-                                                Returns None on failure if not raising exception.
-
-        Raises:
-            subprocess.CalledProcessError: If command fails and check_output is True.
-            subprocess.TimeoutExpired: If the command times out.
-            Exception: For other underlying errors.
+        Uses paramiko if available and password is provided, otherwise falls back to sshpass/ssh.
         """
-        ssh_base_command = [
-            "ssh",
-            "-o", "StrictHostKeyChecking=no",
-            "-o", "BatchMode=yes",
-            "-o", f"ConnectTimeout={min(10, timeout)}" # Ensure connect timeout is reasonable
-        ]
-        if self.ssh_key_path:
-            ssh_base_command.extend(["-i", self.ssh_key_path])
-        
+        import logging
+        logger = logging.getLogger(__name__)
+        # Try paramiko if available and password is provided
+        try:
+            from iperf3_tester import network
+            PARAMIKO_AVAILABLE = getattr(network, 'PARAMIKO_AVAILABLE', False)
+        except Exception:
+            PARAMIKO_AVAILABLE = False
+        if PARAMIKO_AVAILABLE and self.ssh_password:
+            try:
+                import paramiko
+                logger.info(f"Executing remote command via paramiko: {command}")
+                client = paramiko.SSHClient()
+                client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                client.connect(
+                    hostname=self.remote_ip,
+                    username=self.ssh_user,
+                    password=self.ssh_password,
+                    key_filename=self.ssh_key_path if self.ssh_key_path else None,
+                    timeout=timeout,
+                    allow_agent=False,
+                    look_for_keys=False
+                )
+                stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
+                exit_status = stdout.channel.recv_exit_status()
+                out = stdout.read().decode()
+                err = stderr.read().decode()
+                client.close()
+                if exit_status != 0:
+                    logger.error(f"Remote command failed (paramiko): {command}\nReturn Code: {exit_status}\nStdout: {out.strip()}\nStderr: {err.strip()}")
+                    if check_output:
+                        return None
+                    class DummyProcess:
+                        def __init__(self):
+                            self.returncode = exit_status
+                            self.stdout = out
+                            self.stderr = err
+                    return DummyProcess()
+                logger.debug(f"Remote command successful (paramiko): {command}\nStdout: {out.strip()}")
+                if check_output:
+                    return out.strip()
+                class DummyProcess:
+                    def __init__(self):
+                        self.returncode = 0
+                        self.stdout = out
+                        self.stderr = err
+                return DummyProcess()
+            except Exception as e:
+                logger.error(f"Error executing remote command via paramiko: {e}")
+                if check_output:
+                    return None
+                raise
+        # Fallback to sshpass/ssh
+        ssh_base_command = []
+        if self.ssh_password:
+            logger.debug(f"Using sshpass with password length: {len(self.ssh_password)}")
+            ssh_base_command = [
+                "sshpass", "-p", self.ssh_password,
+                "ssh",
+                "-o", "StrictHostKeyChecking=no",
+                "-o", "BatchMode=yes",
+                "-o", f"ConnectTimeout={min(10, timeout)}"
+            ]
+        else:
+            ssh_base_command = [
+                "ssh",
+                "-o", "StrictHostKeyChecking=no",
+                "-o", "BatchMode=yes",
+                "-o", f"ConnectTimeout={min(10, timeout)}"
+            ]
+            if self.ssh_key_path:
+                ssh_base_command.extend(["-i", self.ssh_key_path])
         ssh_base_command.append(f"{self.ssh_user}@{self.remote_ip}")
         full_command_list = ssh_base_command + [command]
-        
         command_str_for_logging = " ".join(full_command_list)
-        # Avoid logging sensitive parts of the command if necessary, though here it's mostly IPs/usernames
+        logger.info(f"SSH command: {command_str_for_logging}")
         logger.debug(f"Executing remote command: {command_str_for_logging}")
-
         try:
             process = subprocess.run(
                 full_command_list,
                 capture_output=True,
                 text=True,
                 timeout=timeout,
-                check=False # We will check returncode manually
+                check=False
             )
-
             if process.returncode != 0:
                 logger.error(
                     f"Remote command failed: {' '.join(full_command_list)}\n"
@@ -84,36 +131,26 @@ class RemoteServerManager:
                     f"Stdout: {process.stdout.strip()}\n"
                     f"Stderr: {process.stderr.strip()}"
                 )
-                if check_output: # if we specifically need output, failure is more critical
-                    # For pgrep, a non-zero exit code might mean "not found", which isn't always an error
-                    # for the caller's logic. So, we don't raise CalledProcessError here universally.
-                    # The caller must check the return code or output.
-                    return None # Indicate failure or "not found"
-                return process # Allow caller to inspect process details
-            
+                if check_output:
+                    return None
+                return process
             logger.debug(
                 f"Remote command successful: {' '.join(full_command_list)}\n"
                 f"Stdout: {process.stdout.strip()}"
             )
-
             if check_output:
                 return process.stdout.strip()
             return process
-
         except subprocess.TimeoutExpired as e:
             logger.error(f"Remote command timed out: {command_str_for_logging}. Error: {e}")
             if check_output:
                 return None
-            # Re-raise or handle as per policy; for now, let it propagate if not check_output
-            # Or, more consistently, return a specific indicator
-            # For this implementation, returning None for check_output and letting caller handle is okay.
-            # If not check_output, the caller might not expect a return value to check.
-            raise  # Re-raise if the caller expects to handle it or it's a critical failure
-        except Exception as e: # Catch other potential errors like FileNotFoundError for ssh
+            raise
+        except Exception as e:
             logger.error(f"Error executing remote command '{command_str_for_logging}': {e}")
             if check_output:
                 return None
-            raise # Re-raise for unexpected errors
+            raise
 
     def start_remote_servers(self):
         """
@@ -342,3 +379,54 @@ def run_iperf3_client_wrapper(test_run_params_dict):
     
     # The original test_run_params_dict (which includes the specific 'title') is returned
     return test_run_params_dict, client_json_output
+
+def run_iperf3_client(
+    target_ip,
+    port,
+    protocol='tcp',
+    direction='tx',
+    message_size=None,
+    window_size=None,
+    duration=10,
+    parallel_streams=1,
+    iperf3_path='iperf3',
+    title_prefix=None,
+    client_options=None,
+    json_output=True
+):
+    """
+    Runs an iperf3 client test with the given parameters and returns the parsed JSON output.
+    """
+    cmd = [iperf3_path, '-c', str(target_ip), '-p', str(port), '-t', str(duration)]
+    if protocol == 'udp':
+        cmd.append('-u')
+    if parallel_streams and int(parallel_streams) > 1:
+        cmd += ['-P', str(parallel_streams)]
+    if message_size:
+        cmd += ['-l', str(message_size)]
+    if window_size:
+        cmd += ['-w', str(window_size)]
+    if json_output:
+        cmd.append('-J')
+    if client_options:
+        cmd += client_options
+    if title_prefix:
+        cmd += ['-T', str(title_prefix)]
+    # Direction (tx/rx/bx) is not directly supported by iperf3 client, so we ignore it here
+    try:
+        logger.info(f"Running iperf3 client: {' '.join(cmd)}")
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=duration+10)
+        if result.returncode != 0:
+            logger.error(f"iperf3 client failed: {result.stderr}")
+            return None
+        if json_output:
+            try:
+                return json.loads(result.stdout)
+            except Exception as e:
+                logger.error(f"Failed to parse iperf3 JSON output: {e}")
+                return result.stdout
+        else:
+            return result.stdout
+    except Exception as e:
+        logger.error(f"Exception running iperf3 client: {e}")
+        return None

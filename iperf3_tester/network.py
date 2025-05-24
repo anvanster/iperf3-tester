@@ -46,122 +46,70 @@ def get_local_ip_address():
 def check_ssh_connectivity(remote_ip, ssh_user, ssh_key_path=None, ssh_password=None, timeout=10):
     """
     Checks SSH connectivity to a remote host.
-
-    Prioritizes using the 'paramiko' library if available. Falls back to
-    using the system 'ssh' command via 'subprocess' if 'paramiko' is not found.
-
-    Args:
-        remote_ip (str): The IP address of the remote host.
-        ssh_user (str): The username for SSH login.
-        ssh_key_path (str, optional): Path to the SSH private key. Defaults to None.
-        ssh_password (str, optional): SSH password. Defaults to None.
-                                      (Note: Using passwords directly is less secure).
-        timeout (int, optional): Timeout in seconds for the connection attempt. Defaults to 10.
-
-    Returns:
-        bool: True if SSH connection is successful, False otherwise.
+    Uses paramiko for password-based SSH if available, otherwise falls back to sshpass or ssh.
     """
-    if not remote_ip or not ssh_user:
-        logger.error("Remote IP and SSH user must be provided for SSH check.")
-        return False
-
-    if PARAMIKO_AVAILABLE:
-        logger.info(f"Attempting SSH to {remote_ip} using paramiko.")
-        client = None
+    logger = logging.getLogger(__name__)
+    if PARAMIKO_AVAILABLE and ssh_password:
         try:
+            logger.info(f"Attempting SSH to {remote_ip} using paramiko.")
+            import paramiko
             client = paramiko.SSHClient()
-            client.set_missing_host_key_policy(paramiko.AutoAddPolicy()) # Not for production
-
-            connect_args = {
-                "hostname": remote_ip,
-                "username": ssh_user,
-                "timeout": timeout,
-                "allow_agent": False, # Disable SSH agent
-                "look_for_keys": False # Disable looking for keys in default locations
-            }
-
-            if ssh_key_path:
-                logger.info(f"Using SSH key: {ssh_key_path}")
-                connect_args["key_filename"] = ssh_key_path
-            elif ssh_password:
-                logger.info("Using SSH password.")
-                connect_args["password"] = ssh_password
-            else:
-                # No key or password provided, paramiko might try other methods or fail.
-                # For non-interactive, this usually means failure if no agent/default key works.
-                logger.warning("Attempting SSH without explicit key or password.")
-
-
-            client.connect(**connect_args)
-            
-            # Execute a simple command
-            stdin, stdout, stderr = client.exec_command("echo SSH_CONNECTION_SUCCESSFUL", timeout=timeout)
-            exit_status = stdout.channel.recv_exit_status() # Wait for command to complete
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            client.connect(
+                hostname=remote_ip,
+                username=ssh_user,
+                password=ssh_password,
+                key_filename=ssh_key_path if ssh_key_path else None,
+                timeout=timeout,
+                allow_agent=False,
+                look_for_keys=False
+            )
+            stdin, stdout, stderr = client.exec_command('echo SSH_OK', timeout=timeout)
             output = stdout.read().decode().strip()
-
-            if exit_status == 0 and "SSH_CONNECTION_SUCCESSFUL" in output:
+            client.close()
+            if output == 'SSH_OK':
                 logger.info(f"SSH connection to {remote_ip} successful (paramiko).")
                 return True
             else:
-                logger.error(f"SSH command execution failed on {remote_ip} (paramiko). Status: {exit_status}, Output: {output}, Stderr: {stderr.read().decode()}")
+                logger.error(f"SSH connection to {remote_ip} failed (paramiko). Output: {output}")
                 return False
-        except paramiko.AuthenticationException as e:
-            logger.error(f"SSH authentication failed for {ssh_user}@{remote_ip} (paramiko): {e}")
+        except Exception as e:
+            logger.error(f"Exception during SSH connectivity check with paramiko: {e}")
             return False
-        except paramiko.SSHException as e:
-            logger.error(f"SSH connection error to {remote_ip} (paramiko): {e}")
-            return False
-        except socket.error as e: # Covers gaierror, timeout, etc.
-            logger.error(f"Socket error during SSH connection to {remote_ip} (paramiko): {e}")
-            return False
-        except Exception as e: # Catch any other unexpected errors
-            logger.error(f"An unexpected error occurred with paramiko SSH to {remote_ip}: {e}")
-            return False
-        finally:
-            if client:
-                client.close()
     else:
-        logger.info(f"Attempting SSH to {remote_ip} using subprocess.")
-        try:
-            ssh_command = [
-                "ssh",
-                "-o", "StrictHostKeyChecking=no",  # Not recommended for production
-                "-o", "BatchMode=yes",            # Ensure non-interactive
-                "-o", f"ConnectTimeout={timeout}"
+        # Use sshpass if password is provided
+        if ssh_password:
+            logger.debug(f"Using sshpass with password length: {len(ssh_password)}")
+            ssh_cmd = [
+                'sshpass', '-p', ssh_password,
+                'ssh',
+                '-o', 'StrictHostKeyChecking=no',
+                '-o', 'BatchMode=yes',
+                '-o', f'ConnectTimeout={min(10, timeout)}',
+                f'{ssh_user}@{remote_ip}',
+                'echo', 'SSH_OK'
+            ]
+        else:
+            ssh_cmd = [
+                'ssh',
+                '-o', 'StrictHostKeyChecking=no',
+                '-o', 'BatchMode=yes',
+                '-o', f'ConnectTimeout={min(10, timeout)}',
             ]
             if ssh_key_path:
-                ssh_command.extend(["-i", ssh_key_path])
-            
-            ssh_command.append(f"{ssh_user}@{remote_ip}")
-            ssh_command.append("echo SSH_CONNECTION_SUCCESSFUL") # Simple command to test
-
-            process = subprocess.run(
-                ssh_command,
-                capture_output=True,
-                text=True,
-                timeout=timeout + 5 # Give subprocess a bit more time than ssh internal timeout
-            )
-            
-            if process.returncode == 0 and "SSH_CONNECTION_SUCCESSFUL" in process.stdout:
-                logger.info(f"SSH connection to {remote_ip} successful (subprocess).")
+                ssh_cmd += ['-i', ssh_key_path]
+            ssh_cmd += [f'{ssh_user}@{remote_ip}', 'echo', 'SSH_OK']
+        logger.info(f"Attempting SSH to {remote_ip} using subprocess.")
+        try:
+            result = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=timeout)
+            if result.returncode == 0 and 'SSH_OK' in result.stdout:
+                logger.info(f"SSH connection to {remote_ip} successful.")
                 return True
             else:
-                logger.error(
-                    f"SSH connection to {remote_ip} failed (subprocess). "
-                    f"Return code: {process.returncode}\n"
-                    f"Stdout: {process.stdout.strip()}\n"
-                    f"Stderr: {process.stderr.strip()}"
-                )
+                logger.error(f"SSH connection to {remote_ip} failed (subprocess). Return code: {result.returncode}\nStdout: {result.stdout}\nStderr: {result.stderr}")
                 return False
-        except subprocess.TimeoutExpired:
-            logger.error(f"SSH connection to {remote_ip} timed out (subprocess).")
-            return False
-        except FileNotFoundError:
-            logger.error("SSH command not found. Please ensure 'ssh' is installed and in PATH.")
-            # This is a system configuration issue, might be better to raise an exception
-            return False
         except Exception as e:
-            logger.error(f"An unexpected error occurred with subprocess SSH to {remote_ip}: {e}")
+            logger.error(f"Exception during SSH connectivity check: {e}")
             return False
 
 if __name__ == '__main__':

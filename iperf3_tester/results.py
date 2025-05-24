@@ -79,19 +79,26 @@ class ReportGenerator:
         Args:
             filename (str): Name of the JSON report file.
         """
-        if not self.results_data:
-            logger.info("No results data to generate JSON report.")
-            return
-
         filepath = os.path.join(self.results_directory, filename)
+        logger.info(f"[DEBUG] Attempting to write JSON report to: {os.path.abspath(filepath)}")
+        if not self.results_data:
+            logger.info("No results data to generate JSON report. (File will still be created as empty list)")
         try:
             with open(filepath, 'w') as f:
                 json.dump(self.results_data, f, indent=4)
             logger.info(f"JSON report successfully generated: {os.path.abspath(filepath)}")
+            # Failsafe: check if file exists after writing
+            if not os.path.isfile(filepath):
+                logger.critical(f"[FATAL] JSON report file missing immediately after write: {os.path.abspath(filepath)}")
+                raise RuntimeError(f"JSON report file missing after write: {os.path.abspath(filepath)}")
+            else:
+                logger.info(f"[DEBUG] JSON report file confirmed present: {os.path.abspath(filepath)}")
         except IOError as e:
             logger.error(f"Error writing JSON report to {filepath}: {e}")
+            raise
         except TypeError as e:
             logger.error(f"TypeError during JSON serialization for {filepath}: {e}. Ensure all data is serializable.")
+            raise
 
 
     def generate_csv_report(self, filename="iperf3_results.csv"):
@@ -213,10 +220,15 @@ class ReportGenerator:
                 writer.writeheader()
                 writer.writerows(flat_results)
             logger.info(f"CSV report successfully generated: {os.path.abspath(filepath)}")
-        except IOError as e:
-            logger.error(f"Error writing CSV report to {filepath}: {e}")
-        except Exception as e: # Catch other potential errors during CSV writing
+            # Failsafe: check if file exists after writing
+            if not os.path.isfile(filepath):
+                logger.critical(f"[FATAL] CSV report file missing immediately after write: {os.path.abspath(filepath)}")
+                raise RuntimeError(f"CSV report file missing after write: {os.path.abspath(filepath)}")
+            else:
+                logger.info(f"[DEBUG] CSV report file confirmed present: {os.path.abspath(filepath)}")
+        except Exception as e:
             logger.error(f"An unexpected error occurred while writing CSV to {filepath}: {e}")
+            raise
 
 if __name__ == '__main__':
     # Example Usage (for testing this module directly)
