@@ -3,7 +3,7 @@
     "remote_ip": "3.3.3.4",
     "port_range": {
       "start": 52001,
-      "end": 52002
+      "end": 52016
     },
     "protocol": "tcp", 
     "bandwidth": "1M", 
@@ -17,11 +17,11 @@
     "parallel_streams": [1], 
     "protocols": ["tcp", "udp"],
     "directions": ["tx", "rx", "bx"],
-    "message_sizes": [null, "64K", "128K"],
+    "message_sizes": ["1K", "2K", "4K", "8K", "16K", "32K", "64K"],
     "window_sizes": [null],
     "reporting_interval": 1,
-    "warmup_time": 0,
-    "udp_bandwidth": "1G",
+    "warmup_time": 3,
+    "udp_bandwidth": "100G",
     "client_options": [] 
   },
   "execution_config": {
